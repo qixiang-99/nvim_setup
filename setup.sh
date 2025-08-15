@@ -8,7 +8,7 @@ ADD_TO_SHELL_RC="${ADD_TO_SHELL_RC:-1}"
 INSTALL_PYRIGHT="${INSTALL_PYRIGHT:-1}"
 FORCE_INSTALL="${FORCE_INSTALL:-0}"
 
-NVIM_CONFIG_REPO="${NVIM_CONFIG_REPO:-git@github.com:qixiang-99/LazyVim.git}"
+NVIM_CONFIG_REPO="${NVIM_CONFIG_REPO:-https://github.com/LazyVim/starter.git}"
 NVIM_CONFIG_BRANCH="${NVIM_CONFIG_BRANCH:-main}"
 NVIM_CONFIG_DEST="${NVIM_CONFIG_DEST:-${HOME}/.config/nvim}"
 
@@ -101,7 +101,7 @@ ensure_path_rc() {
     if ! grep -Fq "${bin_dir}" "$rc"; then
       echo "${line}" >> "$rc"
       echo "Appended PATH to ${rc}"
-    end
+    fi
   done
   export PATH="${PATH}:${bin_dir}"
 }
@@ -126,6 +126,7 @@ setup_nvim_config_from_repo() {
       git -C "${NVIM_CONFIG_DEST}" checkout "${NVIM_CONFIG_BRANCH}"
       git -C "${NVIM_CONFIG_DEST}" pull --ff-only origin "${NVIM_CONFIG_BRANCH}" || git -C "${NVIM_CONFIG_DEST}" pull --rebase
       git -C "${NVIM_CONFIG_DEST}" submodule update --init --recursive || true
+      rm -rf "${NVIM_CONFIG_DEST}/.git" || true
       return 0
     else
       echo "Config at ${NVIM_CONFIG_DEST} has different remote (${remote})."
@@ -137,6 +138,7 @@ setup_nvim_config_from_repo() {
   echo "Cloning ${NVIM_CONFIG_REPO} into ${NVIM_CONFIG_DEST} (branch: ${NVIM_CONFIG_BRANCH})..."
   git clone --branch "${NVIM_CONFIG_BRANCH}" --depth 1 "${NVIM_CONFIG_REPO}" "${NVIM_CONFIG_DEST}"
   git -C "${NVIM_CONFIG_DEST}" submodule update --init --recursive || true
+  rm -rf "${NVIM_CONFIG_DEST}/.git" || true
 }
 
 install_pyright() {
