@@ -4,6 +4,7 @@ set -euo pipefail
 # Defaults (override via env or flags)
 NVIM_VERSION="${NVIM_VERSION:-v0.10.4}"
 NVIM_ARCH="${NVIM_ARCH:-auto}"
+NVIM_INSTALL_METHOD="${NVIM_INSTALL_METHOD:-appimage}"
 INSTALL_DIR="${INSTALL_DIR:-/opt}"
 ADD_TO_SHELL_RC="${ADD_TO_SHELL_RC:-1}"
 INSTALL_PYRIGHT="${INSTALL_PYRIGHT:-1}"
@@ -17,7 +18,7 @@ usage() {
   cat <<EOF
 Usage: $0 [--nvim-version vX.Y.Z] [--arch auto|x86_64|arm64] [--install-dir /opt]
           [--config-repo URL] [--config-branch BRANCH] [--config-dest PATH]
-          [--no-rc] [--no-pyright] [--force]
+          [--method appimage|tarball|apt] [--no-rc] [--no-pyright] [--force]
 
 Options:
   --nvim-version    Neovim release tag (default: ${NVIM_VERSION})
@@ -26,6 +27,7 @@ Options:
   --config-repo     Git URL to your nvim config (default: ${NVIM_CONFIG_REPO})
   --config-branch   Branch to use (default: ${NVIM_CONFIG_BRANCH})
   --config-dest     Destination dir for config (default: ${NVIM_CONFIG_DEST})
+  --method          Install method: appimage|tarball|apt (default: ${NVIM_INSTALL_METHOD})
   --no-rc           Do not modify shell RC files to add PATH
   --no-pyright      Skip installing pyright via pip
   --force           Reinstall Neovim even if already present
@@ -41,6 +43,7 @@ while [[ $# -gt 0 ]]; do
     --config-repo) NVIM_CONFIG_REPO="$2"; shift 2;;
     --config-branch) NVIM_CONFIG_BRANCH="$2"; shift 2;;
     --config-dest) NVIM_CONFIG_DEST="$2"; shift 2;;
+    --method) NVIM_INSTALL_METHOD="$2"; shift 2;;
     --no-rc) ADD_TO_SHELL_RC=0; shift;;
     --no-pyright) INSTALL_PYRIGHT=0; shift;;
     --force) FORCE_INSTALL=1; shift;;
@@ -66,9 +69,11 @@ apt_install() {
     ${SUDO} apt-get update -y
     ${SUDO} apt-get install -y \
       curl tar ripgrep xclip clangd unzip python3-pip git openssh-client \
-      software-properties-common
+      software-properties-common fuse3
+    # AppImage needs FUSE v2 runtime (libfuse.so.2). Try both names safely.
+    ${SUDO} apt-get install -y libfuse2 || ${SUDO} apt-get install -y libfuse2t64 || true
   else
-    echo "apt-get not found. Please install: curl tar ripgrep xclip clangd unzip python3-pip git openssh-client software-properties-common"
+    echo "apt-get not found. Please install: curl tar ripgrep xclip clangd unzip python3-pip git openssh-client software-properties-common fuse3"
   fi
 }
 
@@ -85,16 +90,7 @@ install_nvim_via_apt() {
   ${SUDO} apt-get install -y neovim
 }
 
-ensure_nvim() {
-  local target_dir="${INSTALL_DIR}/nvim-linux64"
-  local target_bin="${target_dir}/bin/nvim"
-  if [[ -x "${target_bin}" && "${FORCE_INSTALL}" -ne 1 ]]; then
-    echo "Neovim already present at ${target_bin}. Skipping install. Use --force to reinstall."
-    return 0
-  fi
-  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-
-  # Resolve architecture
+install_nvim_appimage() {
   local arch="${NVIM_ARCH}"
   if [[ "${arch}" == "auto" || -z "${arch}" ]]; then
     local m
@@ -102,17 +98,75 @@ ensure_nvim() {
     case "${m}" in
       x86_64|amd64) arch="x86_64";;
       aarch64|arm64) arch="arm64";;
-      *) echo "Unsupported architecture detected: ${m}. Use --arch x86_64 or --arch arm64."; exit 1;;
+      *) echo "Unsupported architecture detected: ${m}. Use --arch x86_64 or --arch arm64."; return 1;;
     esac
   else
     case "${arch}" in
       x86_64|amd64) arch="x86_64";;
       arm64|aarch64) arch="arm64";;
-      *) echo "Invalid --arch '${arch}'. Use auto|x86_64|arm64."; exit 1;;
+      *) echo "Invalid --arch '${arch}'. Use auto|x86_64|arm64."; return 1;;
     esac
   fi
 
-  # Fallback to APT if system GLIBC is older than required (2.38)
+  local appimage_name url tmp target_dir target_bin
+  if [[ "${arch}" == "x86_64" ]]; then
+    appimage_name="nvim-linux-x86_64.appimage"
+  else
+    appimage_name="nvim-linux-arm64.appimage"
+  fi
+  url="https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/${appimage_name}"
+
+  echo "Downloading Neovim AppImage ${NVIM_VERSION} for ${arch}..."
+  tmp="$(mktemp -d)"; trap "rm -rf '$tmp'" RETURN
+  if ! curl -fL -o "${tmp}/nvim.appimage" "${url}"; then
+    if [[ "${arch}" == "x86_64" ]]; then
+      # Fallback older name
+      curl -fL -o "${tmp}/nvim.appimage" "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim.appimage" || return 1
+    else
+      return 1
+    fi
+  fi
+
+  target_dir="${INSTALL_DIR}/nvim-appimage"
+  target_bin="${target_dir}/nvim"
+  ${SUDO} mkdir -p "${target_dir}"
+  ${SUDO} rm -f "${target_bin}"
+  ${SUDO} mv "${tmp}/nvim.appimage" "${target_bin}"
+  ${SUDO} chmod 0755 "${target_bin}"
+  echo "Installed Neovim AppImage to ${target_bin}"
+  # If FUSE v2 (libfuse.so.2) is missing, extract and use the embedded nvim instead
+  if ! "${target_bin}" --version >/dev/null 2>&1; then
+    echo "AppImage cannot run (likely missing libfuse.so.2). Extracting contents..."
+    (cd "${target_dir}" && ${SUDO} "${target_bin}" --appimage-extract >/dev/null 2>&1 || true)
+    if [[ -x "${target_dir}/squashfs-root/usr/bin/nvim" ]]; then
+      echo "Using extracted Neovim at ${target_dir}/squashfs-root/usr/bin/nvim"
+    else
+      echo "Extraction failed; consider installing libfuse2. See FUSE docs."
+      return 1
+    fi
+  fi
+  return 0
+}
+
+
+install_nvim_tarball() {
+  local arch="${NVIM_ARCH}"
+  if [[ "${arch}" == "auto" || -z "${arch}" ]]; then
+    local m
+    m="$(uname -m || true)"
+    case "${m}" in
+      x86_64|amd64) arch="x86_64";;
+      aarch64|arm64) arch="arm64";;
+      *) echo "Unsupported architecture detected: ${m}. Use --arch x86_64 or --arch arm64."; return 1;;
+    esac
+  else
+    case "${arch}" in
+      x86_64|amd64) arch="x86_64";;
+      arm64|aarch64) arch="arm64";;
+      *) echo "Invalid --arch '${arch}'. Use auto|x86_64|arm64."; return 1;;
+    esac
+  fi
+
   local glibc_ver
   glibc_ver="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')" || true
   if [[ -z "${glibc_ver}" ]]; then
@@ -121,23 +175,24 @@ ensure_nvim() {
   if [[ -z "${glibc_ver}" ]] || ! dpkg --compare-versions "${glibc_ver}" ge "2.38"; then
     echo "Detected GLIBC ${glibc_ver:-unknown} (< 2.38). Falling back to APT install."
     install_nvim_via_apt
-    return 0
+    return $?
   fi
 
-  echo "Downloading Neovim ${NVIM_VERSION} for ${arch}..."
-  local url primary_fallback
+  local tmp url primary_fallback
+  tmp="$(mktemp -d)"; trap "rm -rf '$tmp'" RETURN
+  echo "Downloading Neovim ${NVIM_VERSION} tarball for ${arch}..."
   if [[ "${arch}" == "x86_64" ]]; then
     url="https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux64.tar.gz"
     primary_fallback="https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-x86_64.tar.gz"
     if ! curl -fL -o "${tmp}/nvim.tar.gz" "${url}"; then
-      curl -fL -o "${tmp}/nvim.tar.gz" "${primary_fallback}"
+      curl -fL -o "${tmp}/nvim.tar.gz" "${primary_fallback}" || return 1
     fi
   else
     url="https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-arm64.tar.gz"
-    curl -fL -o "${tmp}/nvim.tar.gz" "${url}"
+    curl -fL -o "${tmp}/nvim.tar.gz" "${url}" || return 1
   fi
 
-  echo "Installing Neovim to ${INSTALL_DIR}..."
+  echo "Installing Neovim tarball to ${INSTALL_DIR}..."
   ${SUDO} rm -rf "${INSTALL_DIR}/nvim-linux64" "${INSTALL_DIR}/nvim-linux-x86_64" "${INSTALL_DIR}/nvim-linux-arm64" 2>/dev/null || true
   ${SUDO} tar -C "${INSTALL_DIR}" -xzf "${tmp}/nvim.tar.gz"
   if [[ -d "${INSTALL_DIR}/nvim-linux-x86_64" && ! -d "${INSTALL_DIR}/nvim-linux64" ]]; then
@@ -146,28 +201,94 @@ ensure_nvim() {
   if [[ -d "${INSTALL_DIR}/nvim-linux-arm64" && ! -d "${INSTALL_DIR}/nvim-linux64" ]]; then
     ${SUDO} mv "${INSTALL_DIR}/nvim-linux-arm64" "${INSTALL_DIR}/nvim-linux64"
   fi
-  [[ -x "${target_bin}" ]] || { echo "Neovim binary not found after extraction."; exit 1; }
+  [[ -x "${INSTALL_DIR}/nvim-linux64/bin/nvim" ]] || { echo "Neovim binary not found after extraction."; return 1; }
+  return 0
 }
 
+ensure_nvim() {
+  local target_app="${INSTALL_DIR}/nvim-appimage/nvim"
+  local target_tar="${INSTALL_DIR}/nvim-linux64/bin/nvim"
+  if [[ ( -x "${target_app}" || -x "${target_tar}" ) && "${FORCE_INSTALL}" -ne 1 ]]; then
+    echo "Neovim already present. Skipping install. Use --force to reinstall."
+    return 0
+  fi
+
+  local method="${NVIM_INSTALL_METHOD}"
+  case "${method}" in
+    appimage|AppImage)
+      install_nvim_appimage || {
+        echo "AppImage install failed. Falling back to tarball..."
+        install_nvim_tarball || {
+          echo "Tarball install failed. Falling back to APT..."
+          install_nvim_via_apt
+        }
+      }
+      ;;
+    tarball)
+      install_nvim_tarball || install_nvim_via_apt
+      ;;
+    apt|APT)
+      install_nvim_via_apt
+      ;;
+    *)
+      echo "Unknown install method '${method}'. Use appimage|tarball|apt."
+      return 1
+      ;;
+  esac
+}
+
+ 
+link_nvim_bin() {
+  local target=""
+  if [[ -x "${INSTALL_DIR}/nvim-appimage/squashfs-root/usr/bin/nvim" ]]; then
+    target="${INSTALL_DIR}/nvim-appimage/squashfs-root/usr/bin/nvim"
+  elif [[ -x "${INSTALL_DIR}/nvim-appimage/nvim" ]]; then
+    target="${INSTALL_DIR}/nvim-appimage/nvim"
+  elif [[ -x "${INSTALL_DIR}/nvim-linux64/bin/nvim" ]]; then
+    target="${INSTALL_DIR}/nvim-linux64/bin/nvim"
+  elif command -v nvim >/dev/null 2>&1; then
+    return 0
+  else
+    echo "No Neovim binary found to link."
+    return 1
+  fi
+  local link="/usr/local/bin/nvim"
+  ${SUDO} mkdir -p "$(dirname "${link}")"
+  ${SUDO} rm -f "${link}"
+  ${SUDO} ln -s "${target}" "${link}"
+  echo "Symlinked ${link} -> ${target}"
+}
+ 
+
 ensure_path_rc() {
-  local bin_dir="${INSTALL_DIR}/nvim-linux64/bin"
-  local line="export PATH=\"\$PATH:${bin_dir}\""
-  # Only add PATH if the tarball layout exists
-  if [[ ! -d "${INSTALL_DIR}/nvim-linux64" ]]; then
+  local bin_tar="${INSTALL_DIR}/nvim-linux64/bin"
+  local bin_app="${INSTALL_DIR}/nvim-appimage"
+
+  # Only add PATH if any layout exists
+  if [[ ! -d "${bin_tar}" && ! -d "${bin_app}" ]]; then
     return 0
   fi
+
   if [[ "${ADD_TO_SHELL_RC}" -eq 0 ]]; then
-    export PATH="${PATH}:${bin_dir}"
+    [[ -d "${bin_tar}" ]] && export PATH="${PATH}:${bin_tar}"
+    [[ -d "${bin_app}" ]] && export PATH="${PATH}:${bin_app}"
     return 0
   fi
+
   for rc in "${HOME}/.bashrc" "${HOME}/.zshrc"; do
     [[ -f "$rc" ]] || continue
-    if ! grep -Fq "${bin_dir}" "$rc"; then
-      echo "${line}" >> "$rc"
-      echo "Appended PATH to ${rc}"
+    if [[ -d "${bin_tar}" ]] && ! grep -Fq "${bin_tar}" "$rc"; then
+      echo "export PATH=\"\$PATH:${bin_tar}\"" >> "$rc"
+      echo "Appended PATH to ${rc} (tarball bin)"
+    fi
+    if [[ -d "${bin_app}" ]] && ! grep -Fq "${bin_app}" "$rc"; then
+      echo "export PATH=\"\$PATH:${bin_app}\"" >> "$rc"
+      echo "Appended PATH to ${rc} (appimage bin)"
     fi
   done
-  export PATH="${PATH}:${bin_dir}"
+
+  [[ -d "${bin_tar}" ]] && export PATH="${PATH}:${bin_tar}"
+  [[ -d "${bin_app}" ]] && export PATH="${PATH}:${bin_app}"
 }
 
 backup_dir() {
@@ -219,6 +340,7 @@ install_pyright() {
 main() {
   apt_install
   ensure_nvim
+  link_nvim_bin
   ensure_path_rc
   setup_nvim_config_from_repo
   install_pyright
@@ -226,7 +348,9 @@ main() {
   echo "Neovim version:"
   if command -v nvim >/dev/null 2>&1; then
     nvim --version | head -n1
-  else
+  elif [[ -x "${INSTALL_DIR}/nvim-appimage/nvim" ]]; then
+    "${INSTALL_DIR}/nvim-appimage/nvim" --version | head -n1 || true
+  elif [[ -x "${INSTALL_DIR}/nvim-linux64/bin/nvim" ]]; then
     "${INSTALL_DIR}/nvim-linux64/bin/nvim" --version | head -n1 || true
   fi
   echo "Done."
