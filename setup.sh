@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Defaults (override via env or flags)
 NVIM_VERSION="${NVIM_VERSION:-v0.10.4}"
+NVIM_ARCH="${NVIM_ARCH:-auto}"
 INSTALL_DIR="${INSTALL_DIR:-/opt}"
 ADD_TO_SHELL_RC="${ADD_TO_SHELL_RC:-1}"
 INSTALL_PYRIGHT="${INSTALL_PYRIGHT:-1}"
@@ -14,12 +15,13 @@ NVIM_CONFIG_DEST="${NVIM_CONFIG_DEST:-${HOME}/.config/nvim}"
 
 usage() {
   cat <<EOF
-Usage: $0 [--nvim-version vX.Y.Z] [--install-dir /opt]
+Usage: $0 [--nvim-version vX.Y.Z] [--arch auto|x86_64|arm64] [--install-dir /opt]
           [--config-repo URL] [--config-branch BRANCH] [--config-dest PATH]
           [--no-rc] [--no-pyright] [--force]
 
 Options:
   --nvim-version    Neovim release tag (default: ${NVIM_VERSION})
+  --arch            Target architecture: auto|x86_64|arm64 (default: ${NVIM_ARCH})
   --install-dir     Base install dir for Neovim (default: ${INSTALL_DIR})
   --config-repo     Git URL to your nvim config (default: ${NVIM_CONFIG_REPO})
   --config-branch   Branch to use (default: ${NVIM_CONFIG_BRANCH})
@@ -34,6 +36,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --nvim-version) NVIM_VERSION="$2"; shift 2;;
+    --arch) NVIM_ARCH="$2"; shift 2;;
     --install-dir) INSTALL_DIR="$2"; shift 2;;
     --config-repo) NVIM_CONFIG_REPO="$2"; shift 2;;
     --config-branch) NVIM_CONFIG_BRANCH="$2"; shift 2;;
@@ -76,15 +79,46 @@ ensure_nvim() {
     return 0
   fi
   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-  echo "Downloading Neovim ${NVIM_VERSION}..."
-  if ! curl -fL -o "${tmp}/nvim.tar.gz" "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux64.tar.gz"; then
-    curl -fL -o "${tmp}/nvim.tar.gz" "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-x86_64.tar.gz"
+
+  # Resolve architecture
+  local arch="${NVIM_ARCH}"
+  if [[ "${arch}" == "auto" || -z "${arch}" ]]; then
+    local m
+    m="$(uname -m || true)"
+    case "${m}" in
+      x86_64|amd64) arch="x86_64";;
+      aarch64|arm64) arch="arm64";;
+      *) echo "Unsupported architecture detected: ${m}. Use --arch x86_64 or --arch arm64."; exit 1;;
+    esac
+  else
+    case "${arch}" in
+      x86_64|amd64) arch="x86_64";;
+      arm64|aarch64) arch="arm64";;
+      *) echo "Invalid --arch '${arch}'. Use auto|x86_64|arm64."; exit 1;;
+    esac
   fi
+
+  echo "Downloading Neovim ${NVIM_VERSION} for ${arch}..."
+  local url primary_fallback
+  if [[ "${arch}" == "x86_64" ]]; then
+    url="https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux64.tar.gz"
+    primary_fallback="https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-x86_64.tar.gz"
+    if ! curl -fL -o "${tmp}/nvim.tar.gz" "${url}"; then
+      curl -fL -o "${tmp}/nvim.tar.gz" "${primary_fallback}"
+    fi
+  else
+    url="https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-arm64.tar.gz"
+    curl -fL -o "${tmp}/nvim.tar.gz" "${url}"
+  fi
+
   echo "Installing Neovim to ${INSTALL_DIR}..."
-  ${SUDO} rm -rf "${INSTALL_DIR}/nvim-linux64" "${INSTALL_DIR}/nvim-linux-x86_64" 2>/dev/null || true
+  ${SUDO} rm -rf "${INSTALL_DIR}/nvim-linux64" "${INSTALL_DIR}/nvim-linux-x86_64" "${INSTALL_DIR}/nvim-linux-arm64" 2>/dev/null || true
   ${SUDO} tar -C "${INSTALL_DIR}" -xzf "${tmp}/nvim.tar.gz"
   if [[ -d "${INSTALL_DIR}/nvim-linux-x86_64" && ! -d "${INSTALL_DIR}/nvim-linux64" ]]; then
     ${SUDO} mv "${INSTALL_DIR}/nvim-linux-x86_64" "${INSTALL_DIR}/nvim-linux64"
+  fi
+  if [[ -d "${INSTALL_DIR}/nvim-linux-arm64" && ! -d "${INSTALL_DIR}/nvim-linux64" ]]; then
+    ${SUDO} mv "${INSTALL_DIR}/nvim-linux-arm64" "${INSTALL_DIR}/nvim-linux64"
   fi
   [[ -x "${target_bin}" ]] || { echo "Neovim binary not found after extraction."; exit 1; }
 }
