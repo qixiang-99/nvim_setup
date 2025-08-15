@@ -65,10 +65,24 @@ apt_install() {
   if need_cmd apt-get; then
     ${SUDO} apt-get update -y
     ${SUDO} apt-get install -y \
-      curl tar ripgrep xclip clangd unzip python3-pip git openssh-client
+      curl tar ripgrep xclip clangd unzip python3-pip git openssh-client \
+      software-properties-common
   else
-    echo "apt-get not found. Please install: curl tar ripgrep xclip clangd unzip python3-pip git openssh-client"
+    echo "apt-get not found. Please install: curl tar ripgrep xclip clangd unzip python3-pip git openssh-client software-properties-common"
   fi
+}
+
+install_nvim_via_apt() {
+  echo "Installing Neovim via APT (fallback for unsupported GLIBC)..."
+  ${SUDO} apt-get update -y
+  ${SUDO} apt-get install -y software-properties-common
+  if ! need_cmd add-apt-repository; then
+    echo "add-apt-repository not found after installing software-properties-common"
+    exit 1
+  fi
+  ${SUDO} add-apt-repository -y ppa:neovim-ppa/stable
+  ${SUDO} apt-get update -y
+  ${SUDO} apt-get install -y neovim
 }
 
 ensure_nvim() {
@@ -96,6 +110,18 @@ ensure_nvim() {
       arm64|aarch64) arch="arm64";;
       *) echo "Invalid --arch '${arch}'. Use auto|x86_64|arm64."; exit 1;;
     esac
+  fi
+
+  # Fallback to APT if system GLIBC is older than required (2.38)
+  local glibc_ver
+  glibc_ver="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')" || true
+  if [[ -z "${glibc_ver}" ]]; then
+    glibc_ver="$(ldd --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)"
+  fi
+  if [[ -z "${glibc_ver}" ]] || ! dpkg --compare-versions "${glibc_ver}" ge "2.38"; then
+    echo "Detected GLIBC ${glibc_ver:-unknown} (< 2.38). Falling back to APT install."
+    install_nvim_via_apt
+    return 0
   fi
 
   echo "Downloading Neovim ${NVIM_VERSION} for ${arch}..."
@@ -126,6 +152,10 @@ ensure_nvim() {
 ensure_path_rc() {
   local bin_dir="${INSTALL_DIR}/nvim-linux64/bin"
   local line="export PATH=\"\$PATH:${bin_dir}\""
+  # Only add PATH if the tarball layout exists
+  if [[ ! -d "${INSTALL_DIR}/nvim-linux64" ]]; then
+    return 0
+  fi
   if [[ "${ADD_TO_SHELL_RC}" -eq 0 ]]; then
     export PATH="${PATH}:${bin_dir}"
     return 0
